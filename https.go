@@ -11,8 +11,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -25,6 +27,7 @@ const (
 	ConnectMitm
 	ConnectHijack
 	ConnectHTTPMitm
+	ConnectProxyAuthHijack
 )
 
 var (
@@ -32,6 +35,7 @@ var (
 	MitmConnect     = &ConnectAction{Action: ConnectMitm, TLSConfig: TLSConfigFromCA(&GoproxyCa)}
 	HTTPMitmConnect = &ConnectAction{Action: ConnectHTTPMitm, TLSConfig: TLSConfigFromCA(&GoproxyCa)}
 	RejectConnect   = &ConnectAction{Action: ConnectReject, TLSConfig: TLSConfigFromCA(&GoproxyCa)}
+	httpsRegexp     = regexp.MustCompile(`^https:\/\/`)
 )
 
 type ConnectAction struct {
@@ -135,6 +139,7 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 					httpError(proxyClient, ctx, err)
 					return
 				}
+				defer resp.Body.Close()
 			}
 			resp = proxy.filterResponse(resp, ctx)
 			if err := resp.Write(proxyClient); err != nil {
@@ -169,6 +174,7 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 			clientTlsReader := bufio.NewReader(rawClientTls)
 			for !isEof(clientTlsReader) {
 				req, err := http.ReadRequest(clientTlsReader)
+				var ctx = &ProxyCtx{Req: req, Session: atomic.AddInt64(&proxy.sess, 1), proxy: proxy}
 				if err != nil && err != io.EOF {
 					return
 				}
@@ -178,7 +184,10 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 				}
 				req.RemoteAddr = r.RemoteAddr // since we're converting the request, need to carry over the original connecting IP as well
 				ctx.Logf("req %v", r.Host)
-				req.URL, err = url.Parse("https://" + r.Host + req.URL.String())
+
+				if !httpsRegexp.MatchString(req.URL.String()) {
+					req.URL, err = url.Parse("https://" + r.Host + req.URL.String())
+				}
 
 				// Bug fix which goproxy fails to provide request
 				// information URL in the context when does HTTPS MITM
@@ -199,6 +208,8 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 					ctx.Logf("resp %v", resp.Status)
 				}
 				resp = proxy.filterResponse(resp, ctx)
+				defer resp.Body.Close()
+
 				text := resp.Status
 				statusCode := strconv.Itoa(resp.StatusCode) + " "
 				if strings.HasPrefix(text, statusCode) {
@@ -213,6 +224,8 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 				// TODO: use a more reasonable scheme
 				resp.Header.Del("Content-Length")
 				resp.Header.Set("Transfer-Encoding", "chunked")
+				// Force connection close otherwise chrome will keep CONNECT tunnel open forever
+				resp.Header.Set("Connection", "close")
 				if err := resp.Header.Write(rawClientTls); err != nil {
 					ctx.Warnf("Cannot write TLS response header from mitm'd client: %v", err)
 					return
@@ -237,6 +250,9 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 			}
 			ctx.Logf("Exiting on EOF")
 		}()
+	case ConnectProxyAuthHijack:
+		proxyClient.Write([]byte("HTTP/1.1 407 Proxy Authentication Required\r\n"))
+		todo.Hijack(r, proxyClient, ctx)
 	case ConnectReject:
 		if ctx.Resp != nil {
 			if err := ctx.Resp.Write(proxyClient); err != nil {
@@ -292,8 +308,12 @@ func copyAndClose(ctx *ProxyCtx, w, r net.Conn) (bytes int64) {
 		connOk = false
 		ctx.Warnf("Error copying to client: %s", err)
 	}
-	if err := r.Close(); err != nil && connOk {
-		ctx.Warnf("Error closing: %s", err)
+	wg.Done()
+}
+
+func copyAndClose(ctx *ProxyCtx, dst, src *net.TCPConn) {
+	if _, err := io.Copy(dst, src); err != nil {
+		ctx.Warnf("Error copying to client: %s", err)
 	}
 	return bytes
 }
@@ -340,8 +360,12 @@ func (proxy *ProxyHttpServer) NewConnectDialToProxy(https_proxy string) func(net
 				c.Close()
 				return nil, err
 			}
+			defer resp.Body.Close()
 			if resp.StatusCode != 200 {
-				resp, _ := ioutil.ReadAll(resp.Body)
+				resp, err := ioutil.ReadAll(resp.Body)
+				if err != nil {
+					return nil, err
+				}
 				c.Close()
 				return nil, errors.New("proxy refused connection" + string(resp))
 			}
@@ -375,9 +399,12 @@ func (proxy *ProxyHttpServer) NewConnectDialToProxy(https_proxy string) func(net
 				c.Close()
 				return nil, err
 			}
+			defer resp.Body.Close()
 			if resp.StatusCode != 200 {
-				body, _ := ioutil.ReadAll(io.LimitReader(resp.Body, 500))
-				resp.Body.Close()
+				body, err := ioutil.ReadAll(io.LimitReader(resp.Body, 500))
+				if err != nil {
+					return nil, err
+				}
 				c.Close()
 				return nil, errors.New("proxy refused connection" + string(body))
 			}
